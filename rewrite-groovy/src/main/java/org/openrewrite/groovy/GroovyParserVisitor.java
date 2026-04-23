@@ -832,7 +832,7 @@ public class GroovyParserVisitor {
                 JRightPadded<T> converted = JRightPadded.build(node instanceof ClassNode ? (T) visitTypeTree((ClassNode) node) : doVisit(node));
                 if (i == nodes.length - 1) {
                     converted = converted.withAfter(whitespace());
-                    if (',' == source.charAt(cursor)) {
+                    if (cursor < source.length() && ',' == source.charAt(cursor)) {
                         // In Groovy trailing "," are allowed
                         skip(",");
                         converted = converted.withMarkers(Markers.EMPTY.add(new TrailingComma(randomId(), whitespace())));
@@ -905,7 +905,9 @@ public class GroovyParserVisitor {
                 expressions = singletonList(padRight(new J.Empty(randomId(), sourceBefore("}"), Markers.EMPTY), EMPTY));
             } else {
                 expressions = convertAll(expression.getExpressions(), n -> sourceBefore(","), n -> whitespace(), n -> {
-                    if (n == expression.getExpression(expression.getExpressions().size() - 1) && source.charAt(cursor) == ',') {
+                    if (n == expression.getExpression(expression.getExpressions().size() - 1) &&
+                        cursor < source.length() &&
+                        source.charAt(cursor) == ',') {
                         cursor++;
                         return Markers.build(singleton(new TrailingComma(randomId(), whitespace())));
                     }
@@ -943,7 +945,7 @@ public class GroovyParserVisitor {
             Space beforeOpenParen = whitespace();
 
             boolean hasParentheses = true;
-            if (source.charAt(cursor) == '(') {
+            if (cursor < source.length() && source.charAt(cursor) == '(') {
                 skip("(");
             } else {
                 hasParentheses = false;
@@ -973,7 +975,7 @@ public class GroovyParserVisitor {
                 // If it is wrapped in "[]" then this isn't a named arguments situation, and we should not lift the parameters out of the enclosing MapExpression
                 saveCursor = cursor;
                 whitespace();
-                if ('[' != source.charAt(cursor)) {
+                if (cursor >= source.length() || '[' != source.charAt(cursor)) {
                     // Bring named parameters out of their containing MapExpression so that they can be parsed correctly
                     MapExpression namedArgExpressions = (MapExpression) unparsedArgs.get(0);
                     unparsedArgs =
@@ -1003,7 +1005,7 @@ public class GroovyParserVisitor {
                         if (hasParentheses) {
                             saveCursor = cursor;
                             after = whitespace();
-                            if (source.charAt(cursor) == ',') {
+                            if (cursor < source.length() && source.charAt(cursor) == ',') {
                                 skip(",");
                                 trailingCommaSuffix = sourceBefore(")");
                             } else {
@@ -1014,12 +1016,12 @@ public class GroovyParserVisitor {
                     } else if (!(exp instanceof J.Lambda && lastArgumentsAreAllClosures && !hasParentheses)) {
                         after = whitespace();
                         saveCursor = cursor;
-                        if (source.charAt(cursor) == ',') {
+                        if (cursor < source.length() && source.charAt(cursor) == ',') {
                             // we might have a trailing comma
                             skip(",");
                             trailingCommaSuffix = whitespace();
                         }
-                        if (source.charAt(cursor) == ')') {
+                        if (cursor < source.length() && source.charAt(cursor) == ')') {
                             // next argument(s), if they exists, are trailing closures and will have an OmitParentheses marker
                             hasParentheses = false;
                         } else if (trailingCommaSuffix != null) {
@@ -1027,7 +1029,9 @@ public class GroovyParserVisitor {
                             trailingCommaSuffix = null;
                             cursor = saveCursor;
                         }
-                        cursor++;
+                        if (cursor < source.length()) {
+                            cursor++;
+                        }
                     }
 
                   args.add(newRightPadded(exp, after, trailingCommaSuffix));
@@ -2352,7 +2356,7 @@ public class GroovyParserVisitor {
             Space beforeOpenParen = whitespace();
 
             OmitParentheses omitParentheses = null;
-            if (source.charAt(cursor) == '(') {
+            if (cursor < source.length() && source.charAt(cursor) == '(') {
                 skip("(");
             } else {
                 omitParentheses = new OmitParentheses(randomId());
@@ -2376,7 +2380,7 @@ public class GroovyParserVisitor {
                         if (omitParentheses == null) {
                             saveCursor = cursor;
                             after = whitespace();
-                            if (source.charAt(cursor) == ',') {
+                            if (cursor < source.length() && source.charAt(cursor) == ',') {
                                 skip(",");
                                 trailingCommaSuffix = sourceBefore(")");
                             } else {
@@ -2386,11 +2390,13 @@ public class GroovyParserVisitor {
                         }
                     } else {
                         after = whitespace();
-                        if (source.charAt(cursor) == ')') {
+                        if (cursor < source.length() && source.charAt(cursor) == ')') {
                             // the next argument will have an OmitParentheses marker
                             omitParentheses = new OmitParentheses(randomId());
                         }
-                        cursor++;
+                        if (cursor < source.length()) {
+                            cursor++;
+                        }
                     }
 
                   args.add(newRightPadded(arg, after, trailingCommaSuffix));
@@ -2407,7 +2413,8 @@ public class GroovyParserVisitor {
             // Groovy 4 desugars try-with-resources at parse time (getResourceStatements() is always empty).
             // Detect from source: if "(" follows "try", parse resources from source text.
             JContainer<J.Try.Resource> resources = null;
-            boolean hasTryWithResources = source.charAt(indexOfNextNonWhitespace(cursor, source)) == '(';
+            int nextNonWhitespace = indexOfNextNonWhitespace(cursor, source);
+            boolean hasTryWithResources = nextNonWhitespace < source.length() && source.charAt(nextNonWhitespace) == '(';
             if (hasTryWithResources) {
                 Space beforeParen = sourceBefore("(");
                 List<JRightPadded<J.Try.Resource>> resourceList = new ArrayList<>();
