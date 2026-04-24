@@ -89,6 +89,7 @@ public class GroovyParserVisitor {
     private final Charset charset;
     private final boolean charsetBomMarked;
     private final GroovyTypeMapping typeMapping;
+    private final Map<FieldNode, List<FieldNode>> groupedFieldDeclarations = new IdentityHashMap<>();
 
     private int cursor = 0;
 
@@ -415,6 +416,14 @@ public class GroovyParserVisitor {
                 if (!appearsInSource(field)) {
                     continue;
                 }
+                // Track anonymous inner classes from *all* field nodes, including continuation nodes we later skip.
+                // Without this, such classes can be emitted twice: from the field initializer and from innerClasses.
+                if (field.getInitialExpression() instanceof ConstructorCallExpression) {
+                    ConstructorCallExpression cce = (ConstructorCallExpression) field.getInitialExpression();
+                    if (cce.isUsingAnonymousInnerClass() && cce.getType() instanceof InnerClassNode) {
+                        fieldInitializers.add((InnerClassNode) cce.getType());
+                    }
+                }
                 if (field.isEnum()) {
                     enumConstants.add(field);
                     continue;
@@ -423,11 +432,10 @@ public class GroovyParserVisitor {
                 if (field.isSynthetic() && recordComponentNames.contains(field.getName())) {
                     continue;
                 }
-                if (field.getInitialExpression() instanceof ConstructorCallExpression) {
-                    ConstructorCallExpression cce = (ConstructorCallExpression) field.getInitialExpression();
-                    if (cce.isUsingAnonymousInnerClass() && cce.getType() instanceof InnerClassNode) {
-                        fieldInitializers.add((InnerClassNode) cce.getType());
-                    }
+                // Groovy emits one FieldNode per variable in `Type a, b`; only enqueue the first node so
+                // parsing consumes the declaration once and does not advance cursor twice.
+                if (isContinuationFieldDeclaration(field)) {
+                    continue;
                 }
                 sortedByPosition.put(pos(field), field);
             }
@@ -585,28 +593,41 @@ public class GroovyParserVisitor {
 
         private void visitVariableField(FieldNode field) {
             RewriteGroovyVisitor visitor = new RewriteGroovyVisitor(field, this);
+            // Reconstruct the original source declaration (`Type a, b`) from split FieldNodes.
+            List<FieldNode> declarationFields = fieldsInSameDeclaration(field);
+            FieldNode declarationField = declarationFields.get(0);
 
-            List<J.Annotation> annotations = visitAndGetAnnotations(field, this);
+            List<J.Annotation> annotations = visitAndGetAnnotations(declarationField, this);
             List<J.Modifier> modifiers = getModifiers();
-            TypeTree typeExpr = field.isDynamicTyped() ? null : visitTypeTree(field.getOriginType());
+            TypeTree typeExpr = declarationField.isDynamicTyped() ? null : visitTypeTree(declarationField.getOriginType());
 
-            J.Identifier name = new J.Identifier(randomId(), sourceBefore(field.getName()), Markers.EMPTY,
-                    emptyList(), field.getName(), typeMapping.type(field.getOriginType()), typeMapping.variableType(field));
+            List<JRightPadded<J.VariableDeclarations.NamedVariable>> namedVariables = new ArrayList<>(declarationFields.size());
+            for (int i = 0; i < declarationFields.size(); i++) {
+                FieldNode declarationPart = declarationFields.get(i);
+                Space namePrefix = whitespace();
+                String parsedName = skip(declarationPart.getName());
+                J.Identifier name = new J.Identifier(randomId(), namePrefix, Markers.EMPTY,
+                        emptyList(), parsedName, typeMapping.type(declarationPart.getOriginType()), typeMapping.variableType(declarationPart));
 
-            J.VariableDeclarations.NamedVariable namedVariable = new J.VariableDeclarations.NamedVariable(
-                    randomId(),
-                    name.getPrefix(),
-                    Markers.EMPTY,
-                    name.withPrefix(EMPTY),
-                    emptyList(),
-                    null,
-                    typeMapping.variableType(field)
-            );
+                J.VariableDeclarations.NamedVariable namedVariable = new J.VariableDeclarations.NamedVariable(
+                        randomId(),
+                        name.getPrefix(),
+                        Markers.EMPTY,
+                        name.withPrefix(EMPTY),
+                        emptyList(),
+                        null,
+                        typeMapping.variableType(declarationPart)
+                );
 
-            if (field.getInitialExpression() != null) {
-                Space beforeAssign = sourceBefore("=");
-                Expression initializer = visitor.doVisit(field.getInitialExpression());
-                namedVariable = namedVariable.getPadding().withInitializer(padLeft(beforeAssign, initializer));
+                if (declarationPart.getInitialExpression() != null) {
+                    Space beforeAssign = sourceBefore("=");
+                    Expression initializer = visitor.doVisit(declarationPart.getInitialExpression());
+                    namedVariable = namedVariable.getPadding().withInitializer(padLeft(beforeAssign, initializer));
+                }
+
+                // Consume commas between variables here so later visitors start from the correct cursor.
+                Space after = i < declarationFields.size() - 1 ? sourceBefore(",") : EMPTY;
+                namedVariables.add(JRightPadded.build(namedVariable).withAfter(after));
             }
 
             J.VariableDeclarations variableDeclarations = new J.VariableDeclarations(
@@ -617,7 +638,7 @@ public class GroovyParserVisitor {
                     modifiers,
                     typeExpr,
                     null,
-                    singletonList(JRightPadded.build(namedVariable))
+                    namedVariables
             );
 
             queue.add(variableDeclarations);
@@ -3454,6 +3475,31 @@ public class GroovyParserVisitor {
         }
 
         return node.getColumnNumber() >= 0 && node.getLineNumber() >= 0 && node.getLastColumnNumber() >= 0 && node.getLastLineNumber() >= 0;
+    }
+
+    private boolean isContinuationFieldDeclaration(FieldNode field) {
+        // A non-first node in a grouped declaration (`Type a, b`) must not be scheduled independently,
+        // otherwise the declaration is parsed twice and cursor state drifts.
+        List<FieldNode> declarationFields = fieldsInSameDeclaration(field);
+        return declarationFields.get(0) != field;
+    }
+
+    /**
+     * Groovy splits one declaration with multiple variables into several FieldNodes that share the same
+     * declaration span. Grouping by that span lets us parse `Type a, b` as one declaration node.
+     */
+    private List<FieldNode> fieldsInSameDeclaration(FieldNode field) {
+        return groupedFieldDeclarations.computeIfAbsent(field, key -> {
+            List<FieldNode> sameDeclaration = key.getOwner().getFields().stream()
+                    .filter(this::appearsInSource)
+                    .filter(candidate -> candidate.getLineNumber() == key.getLineNumber())
+                    .filter(candidate -> candidate.getLastLineNumber() == key.getLastLineNumber())
+                    .filter(candidate -> candidate.getLastColumnNumber() == key.getLastColumnNumber())
+                    .sorted(Comparator.comparingInt(FieldNode::getColumnNumber))
+                    .collect(toList());
+            // Guarantee non-empty grouping so callers can safely use the first declaration element.
+            return sameDeclaration.isEmpty() ? singletonList(key) : sameDeclaration;
+        });
     }
 
     /**
